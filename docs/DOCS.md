@@ -1,0 +1,721 @@
+# Lockness Cache
+
+High-performance caching system with multiple driver support (Memory, Deno KV,
+Redis) and tagging capabilities.
+
+## Overview
+
+@lockness/cache provides a unified caching API with:
+
+- **Simple API** - get, set, remember, forget, flush
+- **Multiple Drivers** - Memory (fast, volatile), Deno KV (persistent), Redis
+  (distributed)
+- **TTL Support** - Automatic expiration with time-to-live
+- **Tagging** - Group cache entries for batch invalidation
+- **Auto Serialization** - Transparent JSON serialization/deserialization
+- **Counters** - Increment/decrement for rate limiting and metrics
+- **Batch Operations** - Get/set multiple keys efficiently
+
+## Configuration
+
+Le système de cache se configure directement dans votre **Kernel** via le
+décorateur `@Kernel`.
+
+```typescript
+// app/kernel.tsx
+@Kernel({
+    // Configuration simple (utilise les valeurs par défaut : memory, ttl 3600)
+    cache: true,
+
+    // OU Configuration détaillée
+    cache: {
+        driver: 'deno-kv',
+        ttl: 86400, // 24 heures
+        kvPath: './data/cache.db'
+    }
+})
+export class AppKernel { ... }
+```
+
+### Options de configuration
+
+| Option   | Type     | Par défaut   | Description                                                                                                            |
+| :------- | :------- | :----------- | :--------------------------------------------------------------------------------------------------------------------- |
+| `driver` | `string` | `'memory'`   | `'memory'`, `'deno-kv'` ou `'redis'`                                                                                   |
+| `ttl`    | `number` | `3600`       | Durée de vie par défaut en secondes                                                                                    |
+| `kvPath` | `string` | `undefined`  | Chemin vers la DB Deno KV. Recommandé de laisser `undefined` sur Deno Deploy. Peut être piloté par `DATABASE_KV_PATH`. |
+| `prefix` | `string` | `'lockness'` | Préfixe pour toutes les clés de cache                                                                                  |
+
+---
+
+## Decorator-based Caching
+
+Lockness provides a powerful decorator-based caching system that allows you to
+cache entire controller responses with minimal code. This is the recommended way
+to handle route-level caching.
+
+### @Cache Decorator
+
+The `@Cache` decorator can be applied to any controller method to enable
+caching.
+
+```typescript
+import { Cache, Controller, Get } from '@lockness/core'
+
+@Controller('/products')
+export class ProductController {
+    @Get('/:id')
+    @Cache({ ttl: 600, strategy: 'server' })
+    async show(c: Context) {
+        return c.json(await Product.find(c.req.param('id')))
+    }
+}
+```
+
+### Caching Strategies
+
+The `strategy` option determines where the cache is stored:
+
+1. **`server` (Default)**: The response is stored on the server (In-memory, Deno
+   KV, or Redis). When a cached response exists, the controller method is **not
+   executed**, and the cached result is returned immediately.
+2. **`http`**: Sets HTTP `Cache-Control` headers (e.g., `max-age=3600`). This
+   tells the browser and intermediate CDNs (like Cloudflare) to cache the
+   response. The controller method **still executes** if the CDN/browser cache
+   is bypassed or expired.
+3. **`both`**: Combines both strategies. The server caches the result to avoid
+   database hits, and the headers are set to enable CDN caching.
+
+### Helper Decorators
+
+For simpler use cases, you can use these shorthand decorators:
+
+- **`@CacheTTL(seconds)`**: Sets the expiration time.
+- **`@CacheKey(key)`**: Sets a custom cache key (defaults to the request URL).
+
+```typescript
+@Get('/stats')
+@CacheTTL(300)
+@CacheKey('api:global:stats')
+@Cache({ strategy: 'both' })
+async stats(c: Context) { ... }
+```
+
+### How Server-side Caching Works
+
+When using the `server` or `both` strategy, Lockness:
+
+1. Generates a cache key (the URL or your custom key).
+2. Checks the global `CacheContract` provider (resolved from the container).
+3. If a hit occurs, it returns a new `Response` object with the cached body,
+   headers, and status code.
+4. If a miss occurs, it executes the route handler.
+5. If the resulting response is successful (`ok`), it clones the response and
+   stores it in the cache for next time.
+
+---
+
+## Method-level Caching with `@Cached`
+
+`@Cache` (above) caches an **HTTP response** for a route. `@Cached` caches a
+**method's return value**, wherever that method lives — a service, a repository,
+anything. The two are unrelated despite the one-letter difference, and can be
+used together.
+
+```ts
+import { Cached, CacheInvalidate } from '@lockness/cache'
+
+class ReportService {
+    @Cached('5m')
+    async monthly(year: number, month: number) {
+        return await db.expensiveAggregate(year, month)
+    }
+
+    @CacheInvalidate({ tags: ['reports'] })
+    async publish(id: number) {
+        await db.publish(id)
+    }
+}
+```
+
+### The method must be `async`
+
+A TC39 method decorator may only return a replacement with the **same
+signature**, and reading the cache is asynchronous. A synchronous method
+therefore cannot be wrapped without changing its type, which the language
+forbids — decorating one is a compile error, not a silent surprise at runtime.
+
+### Keys
+
+With no `key`, the key is derived as `ClassName.method(args)`. Arguments are
+serialised with sorted object keys, so `find({ a: 1, b: 2 })` and
+`find({ b: 2, a: 1 })` are one entry rather than two.
+
+```ts
+@Cached({ ttl: '1h', key: 'all-active-users' })          // fixed
+@Cached({ ttl: '1h', key: (tenant, id) => `${tenant}:${id}` }) // derived
+```
+
+### TTL
+
+A bare number is **seconds**, matching `set(key, value, 3600)`. Strings carry
+their unit: `'30s'`, `'5m'`, `'2h'`, `'1d'`. A malformed TTL throws when the
+class is defined, not on first call — it is an authoring mistake and should
+surface at authoring time.
+
+> Note the asymmetry with `@Throttle` in `@lockness/core`, where a bare number
+> is **milliseconds**. Each decorator follows the convention of the API it
+> fronts.
+
+### Options
+
+| Option      | Effect                                                     |
+| ----------- | ---------------------------------------------------------- |
+| `ttl`       | How long to keep the value. Omit for no expiry.            |
+| `key`       | Fixed string, or a function of the arguments.              |
+| `tags`      | Tags for group invalidation through `flushByTag`.          |
+| `condition` | Return `false` to bypass the cache for that call entirely. |
+
+A call bypassed by `condition` is neither read from nor written to the cache.
+
+### `null` is never cached
+
+The store cannot distinguish a stored `null` from a miss. Caching it would make
+every later call a miss anyway, while hiding that it was doing so — so a `null`
+result is returned and not stored.
+
+### Invalidation
+
+`@CacheInvalidate({ key?, tags?, timing? })` drops entries around a write.
+`timing` defaults to `'after'`, which runs only when the method **succeeded** —
+a method that threw changed nothing, so the cache is still correct. Use
+`'before'` when the entry must go regardless of the outcome.
+
+---
+
+## Basic Operations
+
+### Get and Set
+
+```typescript
+import { flush, forget, get, has, set } from '@lockness/cache'
+
+// Set a value (with default TTL)
+await set('user:1', { name: 'John', email: 'john@example.com' })
+
+// Set with custom TTL (5 minutes)
+await set('session:abc', sessionData, 300)
+
+// Get a value
+const user = await get('user:1')
+
+// Check if exists
+if (await has('user:1')) {
+    console.log('User cached')
+}
+
+// Delete a key
+await forget('user:1')
+
+// Clear all cache
+await flush()
+```
+
+### Cache Forever
+
+```typescript
+import { forever } from '@lockness/cache'
+
+// Cache without expiration
+await forever('config', configData)
+
+// Same as set() with ttl=0
+await set('permanent', data, 0)
+```
+
+## Remember Pattern
+
+Cache expensive operations automatically:
+
+```typescript
+import { remember, rememberForever } from '@lockness/cache'
+
+// Cache database query result
+const users = await remember('all-users', async () => {
+    return await db.select().from(users).all()
+}, 3600)
+
+// Sync callbacks also work
+const config = await remember('app-config', () => {
+    return JSON.parse(Deno.readTextFileSync('config.json'))
+}, 3600)
+
+// Cache forever
+const settings = await rememberForever('settings', async () => {
+    return await db.select().from(settings).all()
+})
+```
+
+How it works:
+
+1. Check if key exists in cache
+2. If exists, return cached value
+3. If not, execute callback
+4. Store result in cache with TTL
+5. Return result
+
+## Tagging System
+
+Group related cache entries for batch invalidation:
+
+```typescript
+import { forgetByTag, set } from '@lockness/cache'
+
+// Tag individual entries
+await set('post:1', post1, 3600, ['posts', 'featured'])
+await set('post:2', post2, 3600, ['posts'])
+await set('user:1', user1, 3600, ['users'])
+
+// Invalidate all posts (both post:1 and post:2 deleted)
+await forgetByTag('posts')
+
+// user:1 remains cached
+```
+
+### Fluent Tagged Cache
+
+Create a cache store with automatic tagging:
+
+```typescript
+import { cache } from '@lockness/cache'
+
+const postsCache = cache('posts')
+
+// All operations automatically tagged with 'posts'
+await postsCache.set('post:1', post)
+await postsCache.set('post:2', post)
+
+const featured = await postsCache.remember('featured', async () => {
+    return await db.query.posts.findFirst({
+        where: eq(posts.featured, true),
+    })
+}, 600)
+
+// Flush all posts cache
+await postsCache.flush()
+```
+
+### Multiple Tags
+
+```typescript
+const cache = cache('posts', 'homepage')
+
+await cache.set('featured', featuredPosts)
+await cache.set('recent', recentPosts)
+
+// Flush by any tag
+await forgetByTag('homepage') // Deletes both featured and recent
+```
+
+## Counter Operations
+
+Perfect for rate limiting, metrics, and counters:
+
+```typescript
+import { decrement, increment } from '@lockness/cache'
+
+// Page view counter
+await increment('page:123:views')
+await increment('page:123:views', 5) // Increment by 5
+
+// Rate limiting
+const requests = await increment(`api:user:${userId}:requests`)
+if (requests > 100) {
+    throw new Error('Rate limit exceeded')
+}
+
+// Set TTL on first increment
+if (requests === 1) {
+    await set(`api:user:${userId}:requests`, requests, 60) // Reset after 1 minute
+}
+
+// Inventory management
+await decrement('inventory:item:456')
+await decrement('inventory:item:456', 10) // Decrement by 10
+```
+
+## Batch Operations
+
+Efficiently handle multiple keys:
+
+```typescript
+import { many, putMany } from '@lockness/cache'
+
+// Get multiple keys
+const values = await many(['user:1', 'user:2', 'user:3'])
+// Returns: { 'user:1': {...}, 'user:2': {...}, 'user:3': null }
+
+// Set multiple keys
+await putMany({
+    'setting:theme': 'dark',
+    'setting:lang': 'en',
+    'setting:notifications': true,
+}, 3600)
+```
+
+## Additional Helpers
+
+### Add (Set if Not Exists)
+
+```typescript
+import { add } from '@lockness/cache'
+
+// Useful for distributed locks
+const added = await add('lock:process', true, 60)
+if (!added) {
+    console.log('Lock already exists, process running elsewhere')
+    return
+}
+
+// Proceed with locked operation
+try {
+    // ... critical section
+} finally {
+    await forget('lock:process')
+}
+```
+
+### Pull (Get and Delete)
+
+```typescript
+import { pull } from '@lockness/cache'
+
+// Get value and delete in one operation
+const token = await pull('token:abc')
+if (token) {
+    // Use token (now deleted from cache)
+}
+```
+
+### Aliases
+
+```typescript
+import { put } from '@lockness/cache'
+
+// put() is an alias for set()
+await put('key', 'value', 600)
+```
+
+## Drivers
+
+### Memory Driver (Default)
+
+Fast in-memory cache, not persistent:
+
+```typescript
+configureCache({ driver: 'memory' })
+```
+
+**Pros:**
+
+- Fastest performance (no I/O)
+- No external dependencies
+- Great for development
+
+**Cons:**
+
+- Lost on restart
+- Limited by available RAM
+- Single process only (no sharing between workers)
+
+**Best for:**
+
+- Development
+- Single-instance deployments
+- Temporary data (sessions, rate limiting)
+
+### Deno KV Driver
+
+Persistent cache using Deno's built-in KV store:
+
+```typescript
+configureCache({
+    driver: 'deno-kv',
+    kvPath: './data/cache.db', // Optional, defaults to system location
+})
+```
+
+**Pros:**
+
+- Persistent across restarts
+- Built-in to Deno runtime
+- Atomic operations
+- Works with Deno Deploy
+
+**Cons:**
+
+- Slightly slower than memory (disk I/O)
+- Requires file system access (or Deploy KV in production)
+
+**Best for:**
+
+- Production deployments
+- Persistent cache data
+- Multi-worker setups
+
+#### Automatic Value Chunking
+
+Deno KV has a strict **64KB limit** per value. Lockness handles this
+transparently by splitting large values into multiple 60KB chunks. This allows
+you to cache large HTML pages (common in documentation) or large JSON payloads
+without worrying about driver limits.
+
+### Redis Driver
+
+Distributed cache using Redis for multi-instance deployments:
+
+```typescript
+import { createClient } from 'npm:redis'
+import { RedisCacheDriver, setCacheDriver } from '@lockness/cache'
+
+// Connect to Redis
+const redis = createClient({ url: 'redis://localhost:6379' })
+await redis.connect()
+
+// Set the Redis driver
+setCacheDriver(new RedisCacheDriver(redis))
+```
+
+**With Deno's Redis library:**
+
+```typescript
+import { connect } from 'https://deno.land/x/redis/mod.ts'
+import { RedisCacheDriver, setCacheDriver } from '@lockness/cache'
+
+const redis = await connect({ hostname: 'localhost', port: 6379 })
+setCacheDriver(new RedisCacheDriver(redis))
+```
+
+**With custom options:**
+
+```typescript
+setCacheDriver(
+    new RedisCacheDriver(redis, {
+        keyPrefix: 'myapp:cache', // Custom key prefix (default: 'cache')
+        tagPrefix: 'myapp:tag', // Custom tag prefix (default: 'tag')
+        serialize: JSON.stringify, // Custom serializer
+        deserialize: JSON.parse, // Custom deserializer
+    }),
+)
+```
+
+**Pros:**
+
+- Shared across multiple instances
+- High performance (in-memory)
+- Persistent (with Redis persistence)
+- Rich data structure support
+- Cluster support for scaling
+
+**Cons:**
+
+- Requires Redis server
+- Network latency
+- Additional infrastructure
+
+**Best for:**
+
+- Multi-instance deployments
+- Microservices architecture
+- High-traffic applications
+- Shared session storage
+
+## Complete Usage Example
+
+```typescript
+import {
+    cache,
+    configureCache,
+    forgetByTag,
+    increment,
+    remember,
+} from '@lockness/cache'
+
+// Configure cache
+configureCache({
+    driver: 'deno-kv',
+    ttl: 3600,
+    prefix: 'blog',
+    kvPath: './data/cache.db',
+})
+
+// Create tagged cache stores
+const postsCache = cache('posts')
+const usersCache = cache('users')
+
+// Cache expensive queries
+const allPosts = await postsCache.remember('all', async () => {
+    return await db.query.posts.findMany()
+}, 300)
+
+// Cache with multiple tags
+await set('post:123', post, 600, ['posts', 'featured'])
+
+// Rate limiting
+async function checkRateLimit(userId: string): Promise<boolean> {
+    const key = `rate:${userId}`
+    const count = await increment(key)
+
+    if (count === 1) {
+        await set(key, count, 60) // Reset after 1 minute
+    }
+
+    return count <= 100 // Max 100 requests per minute
+}
+
+// Invalidate related caches
+async function updatePost(id: number, data: Partial<Post>) {
+    await db.update(posts).set(data).where(eq(posts.id, id))
+
+    // Invalidate all post caches
+    await forgetByTag('posts')
+}
+
+// Session caching
+await set(`session:${sessionId}`, sessionData, 7200) // 2 hours
+
+// Feature flags
+const features = await rememberForever('feature-flags', async () => {
+    return await db.select().from(featureFlags).all()
+})
+```
+
+## Testing
+
+Clear cache between tests:
+
+```typescript
+import { flush, MemoryCacheDriver } from '@lockness/cache'
+
+Deno.test('my test', async () => {
+    // Clear memory cache
+    MemoryCacheDriver.clear()
+
+    // Or use flush() for any driver
+    await flush()
+
+    // Your test...
+})
+```
+
+## API Reference
+
+### Configuration
+
+```typescript
+configureCache(options: {
+    driver: 'memory' | 'deno-kv'
+    ttl?: number              // Default TTL in seconds
+    prefix?: string           // Key prefix for namespacing
+    kvPath?: string           // Deno KV file path (for deno-kv driver)
+})
+```
+
+### Core Functions
+
+```typescript
+// Get value
+get<T>(key: string): Promise<T | null>
+
+// Set value
+set<T>(key: string, value: T, ttl?: number, tags?: string[]): Promise<void>
+
+// Check existence
+has(key: string): Promise<boolean>
+
+// Delete key
+forget(key: string): Promise<void>
+
+// Clear all cache
+flush(): Promise<void>
+
+// Cache callback result
+remember<T>(key: string, callback: () => T | Promise<T>, ttl?: number, tags?: string[]): Promise<T>
+
+// Cache callback result forever
+rememberForever<T>(key: string, callback: () => T | Promise<T>, tags?: string[]): Promise<T>
+
+// Get multiple keys
+many<T>(keys: string[]): Promise<Record<string, T | null>>
+
+// Set multiple keys
+putMany<T>(values: Record<string, T>, ttl?: number): Promise<void>
+
+// Increment counter
+increment(key: string, amount?: number): Promise<number>
+
+// Decrement counter
+decrement(key: string, amount?: number): Promise<number>
+
+// Add if not exists
+add<T>(key: string, value: T, ttl?: number, tags?: string[]): Promise<boolean>
+
+// Get and delete
+pull<T>(key: string): Promise<T | null>
+
+// Alias for set
+put<T>(key: string, value: T, ttl?: number, tags?: string[]): Promise<void>
+
+// Set forever
+forever<T>(key: string, value: T, tags?: string[]): Promise<void>
+
+// Delete by tag
+forgetByTag(tag: string): Promise<void>
+
+// Alias for forgetByTag
+flushByTag(tag: string): Promise<void>
+```
+
+### Tagged Cache Store
+
+```typescript
+// Create tagged store
+cache(...tags: string[]): CacheStore
+
+// CacheStore methods
+interface CacheStore {
+    get<T>(key: string): Promise<T | null>
+    set<T>(key: string, value: T, ttl?: number): Promise<void>
+    has(key: string): Promise<boolean>
+    forget(key: string): Promise<void>
+    remember<T>(key: string, callback: () => T | Promise<T>, ttl?: number): Promise<T>
+    rememberForever<T>(key: string, callback: () => T | Promise<T>): Promise<T>
+    flush(): Promise<void>
+}
+```
+
+## Best Practices
+
+- **Use memory driver in development**, Deno KV in production
+- **Set appropriate TTLs** - shorter for frequently changing data, longer for
+  static data
+- **Use tagging** to group related cache entries for easy invalidation
+- **Use remember()** pattern to simplify caching logic
+- **Add rate limiting** with increment/decrement
+- **Namespace keys** with prefixes (e.g., 'user:', 'post:')
+- **Clear cache** on deployments if schema changes
+- **Monitor cache hit rates** in production
+- **Use cache for expensive operations** (DB queries, API calls, computations)
+- **Invalidate strategically** - only clear what changed
+
+## Common Use Cases
+
+- **Database query caching** - Cache expensive queries
+- **API response caching** - Cache third-party API responses
+- **Rate limiting** - Limit requests per user/IP
+- **Session storage** - Store session data
+- **Page view counters** - Track views/visits
+- **Feature flags** - Cache feature configuration
+- **User preferences** - Cache user settings
+- **Computed results** - Cache expensive computations
+- **Distributed locks** - Coordinate across workers
