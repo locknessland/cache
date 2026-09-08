@@ -7,8 +7,30 @@
  * @module @lockness/cache/drivers/redis_driver
  */
 
+import {
+    deregisterDisposable,
+    type DisposableHandle,
+    registerDisposable,
+} from '@lockness/contract/lifecycle/internal'
+import { markDriverClosed } from '../closed_drivers.ts'
 import type { CacheDriver, CacheItem } from '../types.ts'
 import { getCacheKey, getExpiresAt, isExpired } from '../config.ts'
+
+/**
+ * Withdraws an owned driver's registration if the driver is garbage-collected
+ * before `close()` runs.
+ *
+ * The registry holds each `Disposable` strongly, so the disposable an owned
+ * driver registers references the driver only through a `WeakRef` — otherwise
+ * the driver would be pinned for the process lifetime and this finalizer could
+ * never fire. The held value is the {@link DisposableHandle}; the unregister
+ * token is the driver, so an explicit `close()` cancels the finalizer.
+ *
+ * @internal
+ */
+const ownedDriverFinalizers = new FinalizationRegistry<DisposableHandle>(
+    (handle) => deregisterDisposable(handle),
+)
 
 /**
  * Redis client interface.
@@ -148,6 +170,15 @@ export interface RedisClient {
  */
 export interface RedisCacheDriverOptions {
     /**
+     * Whether this driver owns the connection and may close it at shutdown.
+     *
+     * **Defaults to `false`**, because the client is handed in already
+     * connected and the application may still be using it elsewhere. Closing
+     * something you were given is how a teardown becomes an outage.
+     */
+    ownsClient?: boolean
+
+    /**
      * Prefix for all Redis cache keys.
      *
      * Helps avoid collisions when sharing Redis with other applications.
@@ -234,6 +265,8 @@ export class RedisCacheDriver implements CacheDriver {
     private readonly serialize: (value: unknown) => string
     /** @internal Deserialization function */
     private readonly deserialize: (value: string) => unknown
+    readonly #ownsClient: boolean = false
+    #handle?: DisposableHandle
 
     /**
      * Create a new Redis cache driver.
@@ -243,6 +276,24 @@ export class RedisCacheDriver implements CacheDriver {
      */
     constructor(client: RedisClient, options: RedisCacheDriverOptions = {}) {
         this.client = client
+        // Register IFF we own the client. A non-owning driver's close() closes
+        // nothing (the application opened the connection and may still be using
+        // it), so enrolling it would only grow the registry for the process
+        // lifetime — a per-tenant driver created and dropped is exactly that
+        // leak (#140). An OWNED driver is additionally enrolled in
+        // ownedDriverFinalizers, so it self-deregisters if it is dropped without
+        // close(); the disposable holds the driver weakly so the registry does
+        // not pin it out of GC's reach.
+        this.#ownsClient = options.ownsClient === true
+        if (this.#ownsClient) {
+            const ref = new WeakRef(this)
+            this.#handle = registerDisposable({
+                name: 'cache:redis',
+                dispose: () => ref.deref()?.close(),
+                priority: 60,
+            })
+            ownedDriverFinalizers.register(this, this.#handle, this)
+        }
         this.keyPrefix = options.keyPrefix ?? 'cache'
         this.tagPrefix = options.tagPrefix ?? 'tag'
         this.serialize = options.serialize ?? JSON.stringify
@@ -485,5 +536,33 @@ export class RedisCacheDriver implements CacheDriver {
 
     async flushByTag(tag: string): Promise<void> {
         await this.forgetByTag(tag)
+    }
+
+    /**
+     * Release the Redis connection — **only if this driver opened it**.
+     *
+     * The client arrives already connected from the application
+     * (`new RedisCacheDriver(client)`, "must be connected"), so by default this
+     * withdraws the registration and closes nothing. Pass `ownsClient: true`
+     * when the driver is the sole owner.
+     *
+     * @example
+     * ```typescript
+     * new RedisCacheDriver(client, { ownsClient: true })
+     * ```
+     */
+    async close(): Promise<void> {
+        markDriverClosed(this)
+        if (this.#handle) {
+            deregisterDisposable(this.#handle)
+            // The driver is being released explicitly — cancel the GC fallback
+            // so it does not fire a second, redundant deregistration later.
+            ownedDriverFinalizers.unregister(this)
+            this.#handle = undefined
+        }
+        if (this.#ownsClient) {
+            await (this.client as { close?: () => void | Promise<void> })
+                .close?.()
+        }
     }
 }
